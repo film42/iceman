@@ -1,5 +1,7 @@
 mod controller {
+    use lazy_static::lazy_static;
     use rppal::pwm::{Channel, Polarity, Pwm};
+    use std::env;
     use std::thread;
     use std::time::Duration;
     use tracing::{debug, error, info};
@@ -19,18 +21,21 @@ mod controller {
         )?;
 
         info!({
-            "hz" = pwm.frequency().unwrap_or_default(),
+            hz = pwm.frequency().unwrap_or_default(),
+            hot_temp = format!("{:.2}", *ICEMAN_HOT_TEMP),
+            max_duty_cycle = format!("{:.2}", *ICEMAN_MAX_DUTY_CYCLE),
+            min_duty_cycle = format!("{:.2}", *ICEMAN_MIN_DUTY_CYCLE),
         }, "Initialized PWM");
 
         thread::spawn(move || {
             // Init so the first tick resets to slow if needed.
-            let mut state = FanState::Fast;
+            let mut state: Option<FanState> = None;
 
             loop {
                 thread::sleep(Duration::from_secs(2));
 
                 match tick(&pwm, state.clone()) {
-                    Ok(new_state) => state = new_state,
+                    Ok(new_state) => state = Some(new_state),
 
                     Err(err) => {
                         error!("Error from controller tick: {:?}", err);
@@ -49,15 +54,31 @@ mod controller {
         Fast,
     }
 
-    const HOT_TEMP: f32 = 78.0;
+    lazy_static! {
+        pub static ref ICEMAN_HOT_TEMP: f64 = env::var("ICEMAN_HOT_TEMP")
+            .unwrap_or_else(|_| "78.0".into())
+            .parse::<f64>()
+            .expect("variable is a valid f64");
+        pub static ref ICEMAN_MAX_DUTY_CYCLE: f64 = env::var("ICEMAN_MAX_DUTY_CYCLE")
+            .unwrap_or_else(|_| "1.0".into())
+            .parse::<f64>()
+            .expect("variable is a valid f64");
+        pub static ref ICEMAN_MIN_DUTY_CYCLE: f64 = env::var("ICEMAN_MIN_DUTY_CYCLE")
+            .unwrap_or_else(|_| "0.65".into())
+            .parse::<f64>()
+            .expect("variable is a valid f64");
+    }
 
-    fn tick(pwm: &Pwm, state: FanState) -> Result<FanState, Box<dyn std::error::Error>> {
+    fn tick(pwm: &Pwm, state: Option<FanState>) -> Result<FanState, Box<dyn std::error::Error>> {
         let temp = match crate::sensors::read_probe_temp() {
-            Ok(temp) => temp,
+            Ok(temp) => temp as f64,
             Err(err) => {
                 error!("Controller: Could not read temp sensor: {:?}", err);
-                error!("Scaling fan to 100% for safety.");
-                pwm.set_duty_cycle(1.0)?;
+                error!(
+                    "Scaling fan to {:.2}% for safety.",
+                    (*ICEMAN_MAX_DUTY_CYCLE * 100.0)
+                );
+                pwm.set_duty_cycle(*ICEMAN_MAX_DUTY_CYCLE)?;
 
                 return Ok(FanState::Fast);
             }
@@ -69,21 +90,22 @@ mod controller {
         }, "Current tick observation");
 
         let new_state = match state {
-            FanState::Slow if temp >= HOT_TEMP => {
+            Some(FanState::Slow) | None if temp >= *ICEMAN_HOT_TEMP => {
                 info!("Increasing fan speed to max power.");
-                pwm.set_duty_cycle(1.0)?;
+                pwm.set_duty_cycle(*ICEMAN_MAX_DUTY_CYCLE)?;
 
                 FanState::Fast
             }
             // To avoid churning at the temp boundary we will chill things for a little longer.
-            FanState::Fast if temp < (HOT_TEMP - 1.0) => {
+            Some(FanState::Fast) | None if temp < (*ICEMAN_HOT_TEMP - 1.0) => {
                 info!("Slowing fan to whisper setting.");
-                pwm.set_duty_cycle(0.65)?;
+                pwm.set_duty_cycle(*ICEMAN_MIN_DUTY_CYCLE)?;
 
                 FanState::Slow
             }
             // If there is no state change required, skip...
-            _ => state,
+            Some(some_state) => some_state,
+            None => unreachable!("State will always be set in the first two conditionals"),
         };
 
         Ok(new_state)
